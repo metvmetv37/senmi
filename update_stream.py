@@ -484,7 +484,7 @@ def write_main_playlist(channels: List[Dict], output_folder: Path, output_playli
     """
     output_folder.mkdir(parents=True, exist_ok=True)
 
-    github_base = "https://raw.githubusercontent.com/Tahir2020/TR_Avrupa/refs/heads/main/playlist"
+    github_base = "https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist"
 
     lines = ["#EXTM3U"]
 
