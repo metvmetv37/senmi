@@ -6,9 +6,11 @@ import re
 import subprocess
 import sys
 import requests
+import os
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 CONFIG_FILE = "config.json"
 COOKIE_FILE = "cookies.txt"
@@ -16,6 +18,15 @@ COOKIE_FILE = "cookies.txt"
 CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
              "AppleWebKit/537.36 (KHTML, like Gecko) "
              "Chrome/148.0.0.0 Safari/537.36")
+
+# YouTube için özel User-Agent'lar
+USER_AGENTS = {
+    "chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+    "edge": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "safari": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    "mobile": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36",
+}
 
 def load_config() -> Dict:
     """Config dosyasını yükler."""
@@ -31,6 +42,8 @@ def load_config() -> Dict:
     config.setdefault("quality", "best[height<=1080][fps<=50]/best")
     config.setdefault("output_folder", "playlist")
     config.setdefault("output_playlist", "playerlist.m3u")
+    config.setdefault("retry_count", 3)
+    config.setdefault("delay_between_retries", 5)
     return config
 
 def safe_filename(name: str) -> str:
@@ -230,8 +243,13 @@ def get_show_turk_token() -> Optional[str]:
         print(f"   ❌ Show Türk hatası: {e}")
         return None
 
-def _run_ytdlp(cmd: List[str], label: str, timeout: int = 140) -> List[str]:
-    """yt-dlp çalıştır, çıktıyı temizle ve hata varsa kısa göster."""
+def _run_ytdlp(cmd: List[str], label: str, timeout: int = 140) -> Tuple[List[str], bool]:
+    """
+    yt-dlp çalıştır, çıktıyı temizle.
+    Returns: (lines, is_bot_error)
+    """
+    is_bot_error = False
+    
     try:
         result = subprocess.run(cmd,
                                capture_output=True,
@@ -240,21 +258,22 @@ def _run_ytdlp(cmd: List[str], label: str, timeout: int = 140) -> List[str]:
                                )
     except subprocess.TimeoutExpired:
         print(f"   ⏱️ Zaman aşımı ({label})")
-        return []
+        return [], False
     except Exception as e:
         print(f"   ❌ yt-dlp çalıştırılamadı ({label}): {e}")
-        return []
+        return [], False
 
     stdout = (result.stdout or "").strip()
     stderr = (result.stderr or "").strip()
 
-    # Cookie hatalarını sessize al (ama yine de devam et)
+    # Bot hatasını tespit et
     if stderr:
-        if "invalid Netscape format" in stderr:
-            pass  # Bu hatayı yoksay
-        elif "Sign in to confirm" in stderr or "bot" in stderr:
+        if "Sign in to confirm" in stderr or "bot" in stderr.lower():
+            is_bot_error = True
             # Bot hatasını kısa göster
             print(f"   ⚠️ {label}: YouTube doğrulama hatası (cookie geçersiz olabilir)")
+        elif "invalid Netscape format" in stderr:
+            pass  # Bu hatayı yoksay
         elif len(stderr) > 0:
             # Diğer hataları kısaca göster
             short_err = stderr if len(stderr) <= 500 else stderr[:500] + " ..."
@@ -262,9 +281,9 @@ def _run_ytdlp(cmd: List[str], label: str, timeout: int = 140) -> List[str]:
                 print(f"   ⚠️ yt-dlp stderr ({label}): {short_err}")
 
     if result.returncode != 0:
-        return []
+        return [], is_bot_error
 
-    return [line.strip() for line in stdout.splitlines() if line.strip()]
+    return [line.strip() for line in stdout.splitlines() if line.strip()], is_bot_error
 
 def _pick_stream_from_lines(lines: List[str]) -> Optional[str]:
     """yt-dlp -g çıktısından oynatılabilir URL seç."""
@@ -283,14 +302,14 @@ def _pick_stream_from_lines(lines: List[str]) -> Optional[str]:
 
     return None
 
-def get_youtube_stream_url(youtube_url: str, quality: str) -> Optional[str]:
+def get_youtube_stream_url(youtube_url: str, quality: str, retry_count: int = 3) -> Optional[str]:
     """
     YouTube canlı yayın URL'sini al.
-    Cookie dosyasını otomatik kullanır.
+    Bot hatası durumunda farklı yöntemlerle yeniden dener.
     """
     cookie_path = Path(COOKIE_FILE)
     
-    # Cookie dosyasını kontrol et - TEMİZLEME YAPMA, sadece kontrol et
+    # Cookie dosyasını kontrol et
     cookie_args: List[str] = []
     if cookie_path.exists() and cookie_path.stat().st_size > 0:
         cookie_args = ["--cookies", COOKIE_FILE]
@@ -298,104 +317,161 @@ def get_youtube_stream_url(youtube_url: str, quality: str) -> Optional[str]:
     else:
         print("   ⚠️ Cookie dosyası yok veya boş, cookiesiz devam ediliyor")
 
-    common = [
-        "yt-dlp",
-        "--no-playlist",
-        "--no-warnings",
-        "--user-agent", CHROME_UA,
-        "--referer", "https://www.youtube.com/",
-        "--geo-bypass",
-        "--socket-timeout", "30",
-        "--sleep-interval", "2",  # Her deneme arası 2 saniye bekle
-        *cookie_args,
+    # Farklı User-Agent'lar ile dene
+    user_agents_to_try = [
+        ("chrome", USER_AGENTS["chrome"]),
+        ("firefox", USER_AGENTS["firefox"]),
+        ("edge", USER_AGENTS["edge"]),
+        ("mobile", USER_AGENTS["mobile"]),
     ]
 
-    attempts: List[tuple[str, List[str]]] = []
+    # Client kombinasyonları
+    client_combinations = [
+        ("mweb,default", "mweb+default"),
+        ("mweb,ios", "mweb+ios"),
+        ("android,mweb", "android+mweb"),
+        ("android,ios", "android+ios"),
+        ("android", "android"),
+        ("ios", "ios"),
+        ("web", "web"),
+        ("tv", "tv"),
+        ("default", "default"),
+    ]
 
-    # 1) En güvenilir yöntem: mweb + default (PO Token gerektirmez)
-    attempts.append((
-        "mweb+default",
-        [
-            *common,
-            "-g",
-            "--extractor-args", "youtube:player-client=mweb,default",
-            "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
-            youtube_url,
-        ],
-    ))
+    # Tüm denemeleri topla
+    all_attempts: List[Tuple[str, List[str]]] = []
 
-    # 2) android + ios (genellikle çalışır)
-    for client in ["android", "ios"]:
-        attempts.append((
-            f"client/{client}",
-            [
-                *common,
-                "-g",
-                "--extractor-args", f"youtube:player-client={client}",
-                "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
-                youtube_url,
-            ],
-        ))
-
-    # 3) web (son çare)
-    attempts.append((
-        "web",
-        [
-            *common,
-            "-g",
-            "--extractor-args", "youtube:player-client=web",
-            "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
-            youtube_url,
-        ],
-    ))
-
-    # 4) tv (bazen işe yarar)
-    attempts.append((
-        "tv",
-        [
-            *common,
-            "-g",
-            "--extractor-args", "youtube:player-client=tv",
-            "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
-            youtube_url,
-        ],
-    ))
-
-    # 5) Cookie'siz deneme (eğer cookie varsa)
-    if cookie_args:
-        no_cookie_common = [
+    for ua_label, ua_string in user_agents_to_try:
+        base_cmd = [
             "yt-dlp",
             "--no-playlist",
             "--no-warnings",
-            "--user-agent", CHROME_UA,
+            "--user-agent", ua_string,
             "--referer", "https://www.youtube.com/",
             "--geo-bypass",
             "--socket-timeout", "30",
             "--sleep-interval", "2",
+            *cookie_args,
         ]
-        attempts.append((
-            "no-cookie",
-            [
-                *no_cookie_common,
-                "-g",
-                "--extractor-args", "youtube:player-client=default",
-                "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
-                youtube_url,
-            ],
-        ))
 
-    for label, cmd in attempts:
+        for client_str, client_label in client_combinations:
+            # Önce HLS formatını dene
+            all_attempts.append((
+                f"{ua_label}/{client_label}/hls",
+                [
+                    *base_cmd,
+                    "-g",
+                    "--extractor-args", f"youtube:player-client={client_str}",
+                    "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
+                    youtube_url,
+                ],
+            ))
+
+            # Sonra genel formatı dene
+            all_attempts.append((
+                f"{ua_label}/{client_label}/best",
+                [
+                    *base_cmd,
+                    "-g",
+                    "--extractor-args", f"youtube:player-client={client_str}",
+                    "-f", quality,
+                    youtube_url,
+                ],
+            ))
+
+    # PO Token ile dene (eğer varsa)
+    po_token = os.environ.get("YOUTUBE_PO_TOKEN", "")
+    if po_token:
+        for ua_label, ua_string in user_agents_to_try[:2]:  # Sadece chrome ve firefox
+            all_attempts.append((
+                f"{ua_label}/po-token",
+                [
+                    "yt-dlp",
+                    "--no-playlist",
+                    "--no-warnings",
+                    "--user-agent", ua_string,
+                    "--referer", "https://www.youtube.com/",
+                    "--geo-bypass",
+                    "--socket-timeout", "30",
+                    *cookie_args,
+                    "-g",
+                    "--extractor-args", f"youtube:player-client=web,default;po_token={po_token}",
+                    "-f", "best",
+                    youtube_url,
+                ],
+            ))
+
+    # Cookie'siz deneme (eğer cookie varsa)
+    if cookie_args:
+        no_cookie_cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--no-warnings",
+            "--user-agent", USER_AGENTS["chrome"],
+            "--referer", "https://www.youtube.com/",
+            "--geo-bypass",
+            "--socket-timeout", "30",
+            "--sleep-interval", "2",
+            "-g",
+            "--extractor-args", "youtube:player-client=default",
+            "-f", "best",
+            youtube_url,
+        ]
+        all_attempts.append(("no-cookie/default", no_cookie_cmd))
+
+    # Denemeleri yap
+    attempted = 0
+    bot_errors = 0
+    
+    for label, cmd in all_attempts:
+        if attempted >= retry_count * 10:  # Maksimum deneme
+            break
+            
         print(f"   ▶️ YouTube deneme: {label}")
-        lines = _run_ytdlp(cmd, label)
+        lines, is_bot_error = _run_ytdlp(cmd, label)
+        
+        if is_bot_error:
+            bot_errors += 1
+            if bot_errors > 5:  # Çok fazla bot hatası varsa
+                print("   ⚠️ Çok fazla bot hatası, cookie yenilenmeli")
+                break
+            time.sleep(1)  # Bot hatası sonrası bekle
+            continue
+            
         stream = _pick_stream_from_lines(lines)
         if stream:
             print(f"   ✅ YouTube stream bulundu: {label}")
+            return stream
+            
+        attempted += 1
+        time.sleep(0.5)  # Denemeler arası bekle
+
+    # Hiçbir yöntem çalışmadıysa, son bir kez cookie'siz dene
+    if cookie_args:
+        print("   🔄 Son çare: Cookie'siz deneme...")
+        final_cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--no-warnings",
+            "--user-agent", USER_AGENTS["firefox"],
+            "--referer", "https://www.youtube.com/",
+            "--geo-bypass",
+            "--socket-timeout", "30",
+            "-g",
+            "--extractor-args", "youtube:player-client=android",
+            "-f", "best",
+            youtube_url,
+        ]
+        lines, _ = _run_ytdlp(final_cmd, "final-no-cookie")
+        stream = _pick_stream_from_lines(lines)
+        if stream:
+            print("   ✅ YouTube stream bulundu: final-no-cookie")
             return stream
 
     print("   ❌ YouTube stream hiçbir yöntemle alınamadı")
     return None
 
-def get_stream_url(channel: Dict, quality: str) -> Optional[str]:
+def get_stream_url(channel: Dict, quality: str, retry_count: int = 3) -> Optional[str]:
     """Kanal tipine göre stream URL'sini al."""
     channel_name = channel.get("name", "")
 
@@ -417,7 +493,7 @@ def get_stream_url(channel: Dict, quality: str) -> Optional[str]:
         return url
 
     print("🎬 YouTube stream alınıyor...")
-    return get_youtube_stream_url(url, quality)
+    return get_youtube_stream_url(url, quality, retry_count)
 
 def create_extinf(channel: Dict, stream_url: str) -> str:
     """EXTINF satırı oluşturur."""
@@ -515,6 +591,7 @@ def main() -> int:
     quality = config["quality"]
     output_folder = Path(config["output_folder"])
     output_playlist = config["output_playlist"]
+    retry_count = config.get("retry_count", 3)
 
     try:
         version = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=20).stdout.strip()
@@ -522,7 +599,7 @@ def main() -> int:
     except Exception as e:
         print(f"⚠️ yt-dlp sürümü okunamadı: {e}")
 
-    # Cookie dosyasını kontrol et - SADECE TEMİZLE, YENİDEN OLUŞTURMA
+    # Cookie dosyasını kontrol et
     cookie_path = Path(COOKIE_FILE)
     if cookie_path.exists():
         print(f"✅ {COOKIE_FILE} bulundu")
@@ -537,8 +614,9 @@ def main() -> int:
         print(f"📄 Geçerli cookie sayısı: {cookie_count}")
         
         if cookie_count > 0:
-            if any("youtube.com" in line for line in cookie_lines):
-                print("✅ YouTube cookie domain bulundu")
+            youtube_cookies = [l for l in cookie_lines if "youtube.com" in l.lower()]
+            if youtube_cookies:
+                print(f"✅ YouTube cookie domain bulundu ({len(youtube_cookies)} adet)")
             else:
                 print("⚠️ YouTube cookie domain bulunamadı")
         else:
@@ -569,7 +647,17 @@ def main() -> int:
             continue
 
         print(f"\n🔄 [{index}/{len(config['channels'])}] {name} taranıyor...")
-        stream_url = get_stream_url(channel, quality)
+        
+        # Her kanal için yeniden dene
+        stream_url = None
+        for attempt in range(retry_count):
+            if attempt > 0:
+                print(f"   🔄 Yeniden deneme {attempt+1}/{retry_count}...")
+                time.sleep(config.get("delay_between_retries", 5))
+            
+            stream_url = get_stream_url(channel, quality, retry_count)
+            if stream_url:
+                break
 
         if not stream_url:
             print(f"❌ {name}: Stream URL alınamadı")
