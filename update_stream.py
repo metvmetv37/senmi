@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 import json
 import re
 import subprocess
 import sys
 import requests
-import os
-import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 CONFIG_FILE = "config.json"
 COOKIE_FILE = "cookies.txt"
@@ -19,17 +16,7 @@ CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
              "AppleWebKit/537.36 (KHTML, like Gecko) "
              "Chrome/148.0.0.0 Safari/537.36")
 
-# YouTube için özel User-Agent'lar
-USER_AGENTS = {
-    "chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-    "edge": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-    "safari": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-    "mobile": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36",
-}
-
 def load_config() -> Dict:
-    """Config dosyasını yükler."""
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         config = json.load(f)
 
@@ -42,12 +29,9 @@ def load_config() -> Dict:
     config.setdefault("quality", "best[height<=1080][fps<=50]/best")
     config.setdefault("output_folder", "playlist")
     config.setdefault("output_playlist", "playerlist.m3u")
-    config.setdefault("retry_count", 3)
-    config.setdefault("delay_between_retries", 5)
     return config
 
 def safe_filename(name: str) -> str:
-    """Güvenli dosya adı oluşturur."""
     replacements = {
         "ç": "c", "Ç": "C",
         "ğ": "g", "Ğ": "G",
@@ -63,63 +47,72 @@ def safe_filename(name: str) -> str:
     return f"{name or 'channel'}.m3u"
 
 def is_direct_m3u8(url: str) -> bool:
-    """URL direkt m3u8 mi kontrol eder."""
     clean = url.lower().split("?", 1)[0]
     return clean.endswith(".m3u8")
 
 def normalize_channel_name(name: str) -> str:
-    """Kanal adını karşılaştırma için normalize eder."""
+    """Kanal adını karşılaştırma için normalize eder.
+
+    Config bazen boşluklu ad, bazen alt çizgili ad kullanıyor
+    (Euro Star TV / Euro_Star_TV gibi). Bu yüzden token kanalı
+    algılamada alt çizgi ve tireleri boşluk kabul ediyoruz.
+    """
     return re.sub(r"[_\-]+", " ", name.lower()).strip()
 
 def is_eurostar_name(name: str) -> bool:
-    """EuroStar kanalı mı kontrol eder."""
     lower = normalize_channel_name(name)
     return "euro star" in lower or "eurostar" in lower or "star avrupa" in lower
 
 def is_show_turk_name(name: str) -> bool:
-    """Show Türk kanalı mı kontrol eder."""
     lower = normalize_channel_name(name)
     return "show" in lower and ("türk" in lower or "turk" in lower)
 
 def clean_cookie_file(cookie_file: str = COOKIE_FILE) -> bool:
-    """
-    Cookie dosyasını temizler - SADECE gerçekten sorunlu olanları siler.
-    ÖNEMLİ: __Secure-YEC ve __Secure-YENID gibi kritik çerezler KORUNUR.
-    """
+    """Geçersiz cookie'leri temizle ve yeni dosya oluştur."""
     path = Path(cookie_file)
     if not path.exists():
         return False
     
-    # SADECE gerçekten sorunlu olanlar (çok nadir)
-    blocked_cookies = ["OTZ"]  # Sadece OTZ'yi temizle, diğerlerine dokunma
+    # Sorunlu cookie'ler
+    blocked_cookies = ["CONSISTENCY", "ST-sbra4i", "OTZ", "__Secure-YEC", "__Secure-YENID"]
     
     try:
         content = path.read_text(encoding="utf-8", errors="ignore")
         lines = content.splitlines()
         
+        # Başlıkları ve geçerli cookie'leri tut
+        cleaned_lines = []
         header_lines = []
         cookie_lines = []
         
         for line in lines:
+            # Başlık satırlarını koru
             if line.startswith("#"):
                 header_lines.append(line)
                 continue
+            
+            # Boş satırları atla
             if not line.strip():
                 continue
             
+            # Cookie'yi kontrol et
             parts = line.split("\t")
             if len(parts) >= 7:
                 cookie_name = parts[5].strip()
+                # Sorunlu cookie'leri filtrele
                 if cookie_name not in blocked_cookies:
                     cookie_lines.append(line)
         
+        # Header + cookie'leri birleştir
         cleaned_lines = header_lines + cookie_lines
         
+        # Eğer hiç cookie kalmadıysa dosyayı boş bırak
         if not cookie_lines:
             path.write_text("", encoding="utf-8")
             print("   ⚠️ Tüm cookie'ler temizlendi, dosya boşaltıldı")
             return True
         
+        # Yeni dosyayı yaz
         path.write_text("\n".join(cleaned_lines), encoding="utf-8")
         print(f"   ✅ Cookie dosyası temizlendi: {len(cookie_lines)} cookie korundu")
         return True
@@ -243,47 +236,36 @@ def get_show_turk_token() -> Optional[str]:
         print(f"   ❌ Show Türk hatası: {e}")
         return None
 
-def _run_ytdlp(cmd: List[str], label: str, timeout: int = 140) -> Tuple[List[str], bool]:
-    """
-    yt-dlp çalıştır, çıktıyı temizle.
-    Returns: (lines, is_bot_error)
-    """
-    is_bot_error = False
-    
+def _run_ytdlp(cmd: List[str], label: str, timeout: int = 140) -> List[str]:
+    """yt-dlp çalıştır, çıktıyı temizle ve hata varsa kısa göster."""
     try:
         result = subprocess.run(cmd,
                                capture_output=True,
                                text=True,
                                timeout=timeout,
                                )
-    except subprocess.TimeoutExpired:
-        print(f"   ⏱️ Zaman aşımı ({label})")
-        return [], False
     except Exception as e:
         print(f"   ❌ yt-dlp çalıştırılamadı ({label}): {e}")
-        return [], False
+        return []
 
     stdout = (result.stdout or "").strip()
     stderr = (result.stderr or "").strip()
 
-    # Bot hatasını tespit et
-    if stderr:
-        if "Sign in to confirm" in stderr or "bot" in stderr.lower():
-            is_bot_error = True
-            # Bot hatasını kısa göster
-            print(f"   ⚠️ {label}: YouTube doğrulama hatası (cookie geçersiz olabilir)")
-        elif "invalid Netscape format" in stderr:
-            pass  # Bu hatayı yoksay
-        elif len(stderr) > 0:
-            # Diğer hataları kısaca göster
-            short_err = stderr if len(stderr) <= 500 else stderr[:500] + " ..."
-            if "ERROR" in stderr or "error" in stderr.lower():
-                print(f"   ⚠️ yt-dlp stderr ({label}): {short_err}")
+    # Cookie hatasını sessize al
+    if stderr and "invalid Netscape format cookies file" not in stderr:
+        # GitHub logunu okunabilir tutmak için çok uzunsa kısalt
+        short_err = stderr if len(stderr) <= 900 else stderr[:900] + " ..."
+        if len(short_err) > 10:  # Sadece anlamlı hataları göster
+            print(f"   ⚠️ yt-dlp stderr ({label}): {short_err}")
 
     if result.returncode != 0:
-        return [], is_bot_error
+        # Cookie hatasını ignore et
+        if "invalid Netscape format cookies file" in stderr:
+            return []
+        print(f"   ❌ yt-dlp çıkış kodu ({label}): {result.returncode}")
+        return []
 
-    return [line.strip() for line in stdout.splitlines() if line.strip()], is_bot_error
+    return [line.strip() for line in stdout.splitlines() if line.strip()]
 
 def _pick_stream_from_lines(lines: List[str]) -> Optional[str]:
     """yt-dlp -g çıktısından oynatılabilir URL seç."""
@@ -302,176 +284,131 @@ def _pick_stream_from_lines(lines: List[str]) -> Optional[str]:
 
     return None
 
-def get_youtube_stream_url(youtube_url: str, quality: str, retry_count: int = 3) -> Optional[str]:
+def get_youtube_stream_url(youtube_url: str, quality: str) -> Optional[str]:
+    """YouTube canlı yayın URL'sini al.
+
+    Cookie hatası durumunda cookie'siz dener.
     """
-    YouTube canlı yayın URL'sini al.
-    Bot hatası durumunda farklı yöntemlerle yeniden dener.
-    """
+    # Cookie dosyasını kontrol et ve temizle
+    cookie_args: List[str] = []
     cookie_path = Path(COOKIE_FILE)
     
-    # Cookie dosyasını kontrol et
-    cookie_args: List[str] = []
     if cookie_path.exists() and cookie_path.stat().st_size > 0:
-        cookie_args = ["--cookies", COOKIE_FILE]
-        print("   🍪 Cookie kullanılıyor")
+        # Cookie'leri temizle
+        clean_cookie_file(COOKIE_FILE)
+        
+        # Tekrar kontrol et
+        if cookie_path.stat().st_size > 0:
+            cookie_args = ["--cookies", COOKIE_FILE]
+            print("   🍪 Cookie kullanılıyor")
+        else:
+            print("   ⚠️ Cookie dosyası boş, cookiesiz devam ediliyor")
     else:
         print("   ⚠️ Cookie dosyası yok veya boş, cookiesiz devam ediliyor")
 
-    # Farklı User-Agent'lar ile dene
-    user_agents_to_try = [
-        ("chrome", USER_AGENTS["chrome"]),
-        ("firefox", USER_AGENTS["firefox"]),
-        ("edge", USER_AGENTS["edge"]),
-        ("mobile", USER_AGENTS["mobile"]),
+    common = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "--user-agent", CHROME_UA,
+        "--referer", "https://www.youtube.com/",
+        "--geo-bypass",
+        "--socket-timeout", "30",
+        *cookie_args,
     ]
 
-    # Client kombinasyonları
-    client_combinations = [
-        ("mweb,default", "mweb+default"),
-        ("mweb,ios", "mweb+ios"),
-        ("android,mweb", "android+mweb"),
-        ("android,ios", "android+ios"),
-        ("android", "android"),
-        ("ios", "ios"),
-        ("web", "web"),
-        ("tv", "tv"),
-        ("default", "default"),
-    ]
+    attempts: List[tuple[str, List[str]]] = []
 
-    # Tüm denemeleri topla
-    all_attempts: List[Tuple[str, List[str]]] = []
-
-    for ua_label, ua_string in user_agents_to_try:
-        base_cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "--no-warnings",
-            "--user-agent", ua_string,
-            "--referer", "https://www.youtube.com/",
-            "--geo-bypass",
-            "--socket-timeout", "30",
-            "--sleep-interval", "2",
-            *cookie_args,
-        ]
-
-        for client_str, client_label in client_combinations:
-            # Önce HLS formatını dene
-            all_attempts.append((
-                f"{ua_label}/{client_label}/hls",
-                [
-                    *base_cmd,
-                    "-g",
-                    "--extractor-args", f"youtube:player-client={client_str}",
-                    "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
-                    youtube_url,
-                ],
-            ))
-
-            # Sonra genel formatı dene
-            all_attempts.append((
-                f"{ua_label}/{client_label}/best",
-                [
-                    *base_cmd,
-                    "-g",
-                    "--extractor-args", f"youtube:player-client={client_str}",
-                    "-f", quality,
-                    youtube_url,
-                ],
-            ))
-
-    # PO Token ile dene (eğer varsa)
-    po_token = os.environ.get("YOUTUBE_PO_TOKEN", "")
-    if po_token:
-        for ua_label, ua_string in user_agents_to_try[:2]:  # Sadece chrome ve firefox
-            all_attempts.append((
-                f"{ua_label}/po-token",
-                [
-                    "yt-dlp",
-                    "--no-playlist",
-                    "--no-warnings",
-                    "--user-agent", ua_string,
-                    "--referer", "https://www.youtube.com/",
-                    "--geo-bypass",
-                    "--socket-timeout", "30",
-                    *cookie_args,
-                    "-g",
-                    "--extractor-args", f"youtube:player-client=web,default;po_token={po_token}",
-                    "-f", "best",
-                    youtube_url,
-                ],
-            ))
-
-    # Cookie'siz deneme (eğer cookie varsa)
-    if cookie_args:
-        no_cookie_cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "--no-warnings",
-            "--user-agent", USER_AGENTS["chrome"],
-            "--referer", "https://www.youtube.com/",
-            "--geo-bypass",
-            "--socket-timeout", "30",
-            "--sleep-interval", "2",
+    # 1) Deno + remote ejs + default client (cookie'li veya cookie'siz)
+    attempts.append((
+        "deno/ejs/default",
+        [
+            *common,
             "-g",
-            "--extractor-args", "youtube:player-client=default",
-            "-f", "best",
+            "--js-runtimes", "deno",
+            "--remote-components", "ejs:github",
+            "--extractor-args", "youtube:player_client=default",
+            "-f", quality,
             youtube_url,
-        ]
-        all_attempts.append(("no-cookie/default", no_cookie_cmd))
+        ],
+    ))
 
-    # Denemeleri yap
-    attempted = 0
-    bot_errors = 0
-    
-    for label, cmd in all_attempts:
-        if attempted >= retry_count * 10:  # Maksimum deneme
-            break
-            
+    # 2) Aynı yöntem ama HLS öncelikli format seçimi
+    attempts.append((
+        "deno/ejs/default/hls",
+        [
+            *common,
+            "-g",
+            "--js-runtimes", "deno",
+            "--remote-components", "ejs:github",
+            "--extractor-args", "youtube:player_client=default",
+            "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
+            youtube_url,
+        ],
+    ))
+
+    # 3) Farklı client denemeleri
+    for client in ["android", "ios", "web", "tv", "mweb"]:
+        attempts.append((
+            f"deno/ejs/{client}",
+            [
+                *common,
+                "-g",
+                "--js-runtimes", "deno",
+                "--remote-components", "ejs:github",
+                "--extractor-args", f"youtube:player_client={client}",
+                "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
+                youtube_url,
+            ],
+        ))
+
+    # 4) Deno olmadan klasik yt-dlp
+    for client in ["default", "android", "ios", "web", "tv"]:
+        attempts.append((
+            f"classic/{client}",
+            [
+                *common,
+                "-g",
+                "--extractor-args", f"youtube:player_client={client}",
+                "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
+                youtube_url,
+            ],
+        ))
+
+    # 5) Son çare: tamamen cookie'siz dene (eğer cookie kullanılıyorsa)
+    if cookie_args:
+        no_cookie_common = [
+            "yt-dlp",
+            "--no-playlist",
+            "--no-warnings",
+            "--user-agent", CHROME_UA,
+            "--referer", "https://www.youtube.com/",
+            "--geo-bypass",
+            "--socket-timeout", "30",
+        ]
+        attempts.append((
+            "no-cookie/default",
+            [
+                *no_cookie_common,
+                "-g",
+                "--extractor-args", "youtube:player_client=default",
+                "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
+                youtube_url,
+            ],
+        ))
+
+    for label, cmd in attempts:
         print(f"   ▶️ YouTube deneme: {label}")
-        lines, is_bot_error = _run_ytdlp(cmd, label)
-        
-        if is_bot_error:
-            bot_errors += 1
-            if bot_errors > 5:  # Çok fazla bot hatası varsa
-                print("   ⚠️ Çok fazla bot hatası, cookie yenilenmeli")
-                break
-            time.sleep(1)  # Bot hatası sonrası bekle
-            continue
-            
+        lines = _run_ytdlp(cmd, label)
         stream = _pick_stream_from_lines(lines)
         if stream:
             print(f"   ✅ YouTube stream bulundu: {label}")
-            return stream
-            
-        attempted += 1
-        time.sleep(0.5)  # Denemeler arası bekle
-
-    # Hiçbir yöntem çalışmadıysa, son bir kez cookie'siz dene
-    if cookie_args:
-        print("   🔄 Son çare: Cookie'siz deneme...")
-        final_cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "--no-warnings",
-            "--user-agent", USER_AGENTS["firefox"],
-            "--referer", "https://www.youtube.com/",
-            "--geo-bypass",
-            "--socket-timeout", "30",
-            "-g",
-            "--extractor-args", "youtube:player-client=android",
-            "-f", "best",
-            youtube_url,
-        ]
-        lines, _ = _run_ytdlp(final_cmd, "final-no-cookie")
-        stream = _pick_stream_from_lines(lines)
-        if stream:
-            print("   ✅ YouTube stream bulundu: final-no-cookie")
             return stream
 
     print("   ❌ YouTube stream hiçbir yöntemle alınamadı")
     return None
 
-def get_stream_url(channel: Dict, quality: str, retry_count: int = 3) -> Optional[str]:
+def get_stream_url(channel: Dict, quality: str) -> Optional[str]:
     """Kanal tipine göre stream URL'sini al."""
     channel_name = channel.get("name", "")
 
@@ -493,15 +430,13 @@ def get_stream_url(channel: Dict, quality: str, retry_count: int = 3) -> Optiona
         return url
 
     print("🎬 YouTube stream alınıyor...")
-    return get_youtube_stream_url(url, quality, retry_count)
+    return get_youtube_stream_url(url, quality)
 
 def create_extinf(channel: Dict, stream_url: str) -> str:
-    """EXTINF satırı oluşturur."""
     name = channel.get("name", "Unknown")
     return f"#EXTINF:0,{name}\n{stream_url}"
 
 def write_single_channel_file(channel: Dict, stream_url: str, output_folder: Path) -> Path:
-    """Her kanal için ayrı M3U dosyası oluşturur."""
     output_folder.mkdir(parents=True, exist_ok=True)
 
     filename = channel.get("m3u_file") or safe_filename(channel["name"])
@@ -542,7 +477,11 @@ def playlist_display_name(channel: Dict) -> str:
     return re.sub(r"\.m3u8?$", "", filename, flags=re.IGNORECASE)
 
 def write_main_playlist(channels: List[Dict], output_folder: Path, output_playlist: str) -> Path:
-    """Ana playlisti yazar."""
+    """Ana playlisti yazar.
+
+    Show Türk raw .m3u üzerinden açılmadığı için ana listede direkt stream URL kullanılır.
+    Diğer kanallar kanal .m3u dosyalarına Raw GitHub linkiyle yazılır.
+    """
     output_folder.mkdir(parents=True, exist_ok=True)
 
     github_base = "https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist"
@@ -575,7 +514,6 @@ def write_main_playlist(channels: List[Dict], output_folder: Path, output_playli
     return path
 
 def main() -> int:
-    """Ana fonksiyon."""
     print("=" * 60)
     print("🎬 TV Kanalları M3U Güncelleyici (Token + Cookie Desteği)")
     print("=" * 60)
@@ -591,7 +529,6 @@ def main() -> int:
     quality = config["quality"]
     output_folder = Path(config["output_folder"])
     output_playlist = config["output_playlist"]
-    retry_count = config.get("retry_count", 3)
 
     try:
         version = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=20).stdout.strip()
@@ -599,12 +536,12 @@ def main() -> int:
     except Exception as e:
         print(f"⚠️ yt-dlp sürümü okunamadı: {e}")
 
-    # Cookie dosyasını kontrol et
+    # Cookie dosyasını kontrol et ve temizle
     cookie_path = Path(COOKIE_FILE)
     if cookie_path.exists():
         print(f"✅ {COOKIE_FILE} bulundu")
         
-        # Cookie'leri temizle (SADECE OTZ'yi sil)
+        # Cookie'leri temizle
         clean_cookie_file(COOKIE_FILE)
         
         # Cookie bilgilerini göster
@@ -614,27 +551,22 @@ def main() -> int:
         print(f"📄 Geçerli cookie sayısı: {cookie_count}")
         
         if cookie_count > 0:
-            youtube_cookies = [l for l in cookie_lines if "youtube.com" in l.lower()]
-            if youtube_cookies:
-                print(f"✅ YouTube cookie domain bulundu ({len(youtube_cookies)} adet)")
+            if any("youtube.com" in line for line in cookie_lines):
+                print("✅ YouTube cookie domain bulundu")
             else:
                 print("⚠️ YouTube cookie domain bulunamadı")
         else:
             print("⚠️ Geçerli cookie yok, cookiesiz devam edilecek")
     else:
         print(f"⚠️ {COOKIE_FILE} bulunamadı, cookiesiz devam ediliyor")
-        print("💡 İpucu: YouTube için cookies.txt oluşturmak için:")
-        print("   1. Tarayıcıda gizli pencere açıp YouTube'a giriş yapın")
-        print("   2. https://www.youtube.com/robots.txt adresini açın")
-        print("   3. 'Get cookies.txt LOCALLY' eklentisiyle dışa aktarın")
 
     output_folder.mkdir(parents=True, exist_ok=True)
 
-    # Eski dosyaları temizle
     for pattern in ("*.m3u", "*.m3u8"):
         for old_file in output_folder.glob(pattern):
             old_file.unlink()
 
+    playlist_entries: List[str] = []
     successful_channels: List[Dict] = []
     failed_channels: List[str] = []
 
@@ -647,17 +579,7 @@ def main() -> int:
             continue
 
         print(f"\n🔄 [{index}/{len(config['channels'])}] {name} taranıyor...")
-        
-        # Her kanal için yeniden dene
-        stream_url = None
-        for attempt in range(retry_count):
-            if attempt > 0:
-                print(f"   🔄 Yeniden deneme {attempt+1}/{retry_count}...")
-                time.sleep(config.get("delay_between_retries", 5))
-            
-            stream_url = get_stream_url(channel, quality, retry_count)
-            if stream_url:
-                break
+        stream_url = get_stream_url(channel, quality)
 
         if not stream_url:
             print(f"❌ {name}: Stream URL alınamadı")
@@ -667,6 +589,7 @@ def main() -> int:
         channel["_stream_url"] = stream_url
 
         single_file = write_single_channel_file(channel, stream_url, output_folder)
+        playlist_entries.append(create_extinf(channel, stream_url))
         successful_channels.append(channel)
         print(f"✅ {name}: {single_file} oluşturuldu")
 
