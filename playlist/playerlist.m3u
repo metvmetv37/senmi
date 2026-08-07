@@ -1,8 +1,4 @@
 #EXTM3U
-#EXTINF:0,Show_Turk
-https://ciner-live.ercdn.net/showturk/playlist.m3u8?e=1786112105&st=fXjWvOJJa-PNywbnKzUq2A&tv=1
-#EXTINF:0,Show_Max
-https://rmtftbjlne.turknet.ercdn.net/bpeytmnqyp/showmax/showmax_1080p.m3u8
 #EXTINF:0,24 TV
 https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/24_TV.m3u
 #EXTINF:0,A2
@@ -47,6 +43,10 @@ https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/Kurt
 https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/NOW.m3u
 #EXTINF:0,NTV
 https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/NTV.m3u
+#EXTINF:0,Show Max
+https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/Show_Max.m3u
+#EXTINF:0,Show Turk
+https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/Show_Turk.m3u
 #EXTINF:0,Sozcu TV
 https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/Sozcu_TV.m3u
 #EXTINF:0,TGRT Haber
