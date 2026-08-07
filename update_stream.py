@@ -1,303 +1,472 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-M3U PLAYLIST YENİDEN OLUŞTURUCU - TAM KOD
-Tüm .m3u dosyalarını tarar, playerlist.m3u'yu tamamen yeniden oluşturur.
-Eksik kanalları, boş satırları temizler, geçersiz URL'leri filtreler.
+YOUTUBE STREAM KURTARICI - M3U ENTEGRASYONU
+Tüm YouTube kanallarının gerçek stream URL'lerini çeker ve M3U dosyalarını günceller.
+Bot korumasını aşmak için çoklu yöntem kullanır.
 """
 
 import os
 import re
 import sys
 import json
+import time
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Optional, Set
+from typing import Optional, Dict, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============ KONFIGÜRASYON ============
 PLAYLIST_DIR = Path("playlist")
-OUTPUT_FILE = PLAYLIST_DIR / "playerlist.m3u"
-BACKUP_FILE = PLAYLIST_DIR / "playerlist.m3u.bak"
-GITHUB_RAW_BASE = "https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist"
+CONFIG_FILE = "config.json"
+COOKIE_FILE = "cookies.txt"
+TIMEOUT = 120
+MAX_RETRIES = 3
+WORKERS = 4  # Paralel işlem için
 
-# Özel kanallar - doğrudan stream URL kullanılacak (dosya referansı değil)
-DIRECT_STREAM_CHANNELS = {"Show_Turk", "Show_Max"}  # Show_Max da token gerektiriyorsa ekle
-
-# Show_Turk token yenileme URL'si
-SHOWTURK_PAGE = "https://www.showturk.com.tr/canli-yayin"
-SHOWTURK_PATTERN = r'playlist\.m3u8\?e=(\d+)&st=([^"\s&]+)'
+CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 
 # ============ YARDIMCI FONKSİYONLAR ============
+
+def load_config() -> Dict:
+    """config.json'dan kanal listesini yükler."""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[HATA] Config yüklenemedi: {e}")
+        return {"channels": []}
+
+def get_channel_type(channel: Dict) -> str:
+    """Kanal tipini belirler: 'youtube', 'direct', 'eurostar', 'showturk'"""
+    name = channel.get("name", "")
+    url = channel.get("url") or channel.get("youtube_url", "")
+    
+    if "youtube.com" in url or "youtu.be" in url:
+        return "youtube"
+    if "eurostar" in name.lower() or "euro" in name.lower():
+        return "eurostar"
+    if "show_turk" in name.lower() or "showturk" in name.lower():
+        return "showturk"
+    if url.endswith(".m3u8") or "m3u8" in url:
+        return "direct"
+    return "unknown"
+
+def clean_cookie_file() -> bool:
+    """Cookie dosyasını temizler ve geçersiz cookie'leri kaldırır."""
+    cookie_path = Path(COOKIE_FILE)
+    if not cookie_path.exists():
+        return False
+    
+    blocked = ["CONSISTENCY", "ST-sbra4i", "OTZ", "__Secure-YEC", "__Secure-YENID"]
+    try:
+        content = cookie_path.read_text(encoding="utf-8", errors="ignore")
+        lines = content.splitlines()
+        cleaned = []
+        cookie_count = 0
+        for line in lines:
+            if line.startswith("#"):
+                cleaned.append(line)
+                continue
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                name = parts[5].strip()
+                if name not in blocked:
+                    cleaned.append(line)
+                    cookie_count += 1
+        if cookie_count > 0:
+            cookie_path.write_text("\n".join(cleaned), encoding="utf-8")
+            print(f"[COOKIE] {cookie_count} geçerli cookie korundu.")
+            return True
+        else:
+            cookie_path.write_text("", encoding="utf-8")
+            print("[COOKIE] Tüm cookie'ler temizlendi, dosya boşaltıldı.")
+            return False
+    except Exception as e:
+        print(f"[COOKIE] Temizleme hatası: {e}")
+        return False
+
+def get_cookies_from_browser(browser: str = "chrome") -> bool:
+    """Tarayıcıdan cookie çeker."""
+    cmd = [
+        "yt-dlp",
+        "--cookies-from-browser", browser,
+        "--cookies", COOKIE_FILE,
+        "--simulate",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    ]
+    try:
+        subprocess.run(cmd, check=True, timeout=30, capture_output=True)
+        print(f"[COOKIE] {browser} üzerinden cookie çekildi.")
+        return True
+    except Exception as e:
+        print(f"[COOKIE] Tarayıcıdan cookie çekilemedi: {e}")
+        return False
+
+def ensure_cookies() -> bool:
+    """Cookie'lerin varlığını ve geçerliliğini kontrol eder."""
+    cookie_path = Path(COOKIE_FILE)
+    if cookie_path.exists() and cookie_path.stat().st_size > 100:
+        clean_cookie_file()
+        if cookie_path.stat().st_size > 50:
+            print("[COOKIE] Mevcut cookie'ler kullanılıyor.")
+            return True
+    
+    # Cookie yok veya çok küçük, tarayıcıdan dene
+    print("[COOKIE] Cookie dosyası geçersiz, tarayıcıdan çekiliyor...")
+    for browser in ["chrome", "firefox", "brave", "edge"]:
+        if get_cookies_from_browser(browser):
+            return True
+    
+    print("[UYARI] Cookie alınamadı, cookiesiz devam ediliyor.")
+    return False
+
+# ============ YOUTUBE STREAM ALMA ============
+
+def get_youtube_stream_with_ytdlp(video_url: str, quality: str = "best[height<=1080][fps<=50]/best") -> Optional[str]:
+    """yt-dlp ile YouTube stream URL'sini alır."""
+    cookie_arg = ["--cookies", COOKIE_FILE] if Path(COOKIE_FILE).exists() else []
+    
+    # Farklı client'ler ve yöntemler
+    methods = [
+        # 1. Deno + ejs + default client
+        {
+            "name": "deno/ejs/default",
+            "cmd": [
+                "yt-dlp",
+                "--no-playlist",
+                "--no-warnings",
+                "--user-agent", CHROME_UA,
+                "--referer", "https://www.youtube.com/",
+                "--geo-bypass",
+                "--socket-timeout", "30",
+                *cookie_arg,
+                "--js-runtimes", "deno",
+                "--remote-components", "ejs:github",
+                "--extractor-args", "youtube:player_client=default",
+                "-f", quality,
+                "-g",
+                video_url
+            ]
+        },
+        # 2. Deno + ejs + android client (genelde işe yarar)
+        {
+            "name": "deno/ejs/android",
+            "cmd": [
+                "yt-dlp",
+                "--no-playlist",
+                "--no-warnings",
+                "--user-agent", CHROME_UA,
+                "--referer", "https://www.youtube.com/",
+                "--geo-bypass",
+                "--socket-timeout", "30",
+                *cookie_arg,
+                "--js-runtimes", "deno",
+                "--remote-components", "ejs:github",
+                "--extractor-args", "youtube:player_client=android",
+                "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
+                "-g",
+                video_url
+            ]
+        },
+        # 3. Deno + ejs + ios client
+        {
+            "name": "deno/ejs/ios",
+            "cmd": [
+                "yt-dlp",
+                "--no-playlist",
+                "--no-warnings",
+                "--user-agent", CHROME_UA,
+                "--referer", "https://www.youtube.com/",
+                "--geo-bypass",
+                "--socket-timeout", "30",
+                *cookie_arg,
+                "--js-runtimes", "deno",
+                "--remote-components", "ejs:github",
+                "--extractor-args", "youtube:player_client=ios",
+                "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
+                "-g",
+                video_url
+            ]
+        },
+        # 4. Klasik yöntem - android
+        {
+            "name": "classic/android",
+            "cmd": [
+                "yt-dlp",
+                "--no-playlist",
+                "--no-warnings",
+                "--user-agent", CHROME_UA,
+                "--referer", "https://www.youtube.com/",
+                "--geo-bypass",
+                "--socket-timeout", "30",
+                *cookie_arg,
+                "--extractor-args", "youtube:player_client=android",
+                "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
+                "-g",
+                video_url
+            ]
+        },
+        # 5. Klasik yöntem - default (cookie'siz de dene)
+        {
+            "name": "classic/default",
+            "cmd": [
+                "yt-dlp",
+                "--no-playlist",
+                "--no-warnings",
+                "--user-agent", CHROME_UA,
+                "--referer", "https://www.youtube.com/",
+                "--geo-bypass",
+                "--socket-timeout", "30",
+                "--extractor-args", "youtube:player_client=default",
+                "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
+                "-g",
+                video_url
+            ]
+        },
+        # 6. Klasik yöntem - tv client
+        {
+            "name": "classic/tv",
+            "cmd": [
+                "yt-dlp",
+                "--no-playlist",
+                "--no-warnings",
+                "--user-agent", CHROME_UA,
+                "--referer", "https://www.youtube.com/",
+                "--geo-bypass",
+                "--socket-timeout", "30",
+                *cookie_arg,
+                "--extractor-args", "youtube:player_client=tv",
+                "-f", "best[protocol=m3u8_native]/best[protocol=m3u8]/best",
+                "-g",
+                video_url
+            ]
+        }
+    ]
+    
+    for method in methods:
+        try:
+            print(f"   ▶️ {method['name']}")
+            result = subprocess.run(
+                method["cmd"],
+                capture_output=True,
+                text=True,
+                timeout=TIMEOUT
+            )
+            if result.returncode == 0:
+                lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+                for line in lines:
+                    if line.startswith("http") and (".m3u8" in line or "manifest" in line or "googlevideo" in line):
+                        print(f"   ✅ {method['name']} başarılı")
+                        return line
+            # Hata mesajını kısaca göster
+            if result.stderr:
+                err = result.stderr[:150].replace("\n", " ")
+                print(f"   ⚠️ {err}")
+        except subprocess.TimeoutExpired:
+            print(f"   ⏱️ {method['name']} zaman aşımı")
+        except Exception as e:
+            print(f"   ❌ {method['name']} hata: {e}")
+    
+    return None
+
+def get_eurostar_token() -> Optional[str]:
+    """EuroStar TV 1080p stream URL'sini alır."""
+    headers = {"User-Agent": CHROME_UA}
+    try:
+        import requests
+        html = requests.get("https://www.eurostartv.com.tr/canli-izle", headers=headers, timeout=15).text
+        match = re.search(r"var liveUrl = 'https://dygvideo\.dygdigital\.com/live/hls/staravrupa\?token=([a-f0-9]+)';", html)
+        if match:
+            token = match.group(1)
+            token_url = f"https://dygvideo.dygdigital.com/live/hls/staravrupa?token={token}"
+            resp = requests.get(token_url, headers=headers, allow_redirects=False, timeout=10)
+            if resp.status_code == 302 and "Location" in resp.headers:
+                master = resp.headers["Location"]
+                # 1080p'ye yönlendir
+                match2 = re.match(r"(.*/)live\.m3u8\?(.*)", master)
+                if match2:
+                    return f"{match2.group(1)}live_1080p3000000kbps/index.m3u8?{match2.group(2)}"
+                return master
+        return None
+    except Exception as e:
+        print(f"[EUROSTAR] Hata: {e}")
+        return None
+
+def get_showturk_token() -> Optional[str]:
+    """Show Türk stream URL'sini alır."""
+    try:
+        import requests
+        html = requests.get("https://www.showturk.com.tr/canli-yayin", timeout=15).text
+        match = re.search(r'playlist\.m3u8\?e=(\d+)&st=([^"\s&]+)', html)
+        if match:
+            e, st = match.groups()
+            return f"https://ciner-live.ercdn.net/showturk/playlist.m3u8?e={e}&st={st}&tv=1"
+        return None
+    except Exception as e:
+        print(f"[SHOWTURK] Hata: {e}")
+        return None
+
+# ============ M3U DOSYALARINI GÜNCELLE ============
+
+def update_m3u_file(filepath: Path, stream_url: str) -> bool:
+    """M3U dosyasını günceller."""
+    if not filepath.exists():
+        return False
+    
+    try:
+        content = filepath.read_text(encoding="utf-8", errors="ignore")
+        lines = content.splitlines()
+        new_lines = []
+        url_found = False
+        
+        for line in lines:
+            if line.strip().startswith("http") and not url_found:
+                new_lines.append(stream_url)
+                url_found = True
+            else:
+                new_lines.append(line)
+        
+        # Eğer URL yoksa sonuna ekle
+        if not url_found:
+            new_lines.append(stream_url)
+        
+        filepath.write_text("\n".join(new_lines), encoding="utf-8")
+        return True
+    except Exception as e:
+        print(f"[HATA] {filepath.name} güncellenemedi: {e}")
+        return False
+
+def update_m3u_direct(filepath: Path, stream_url: str) -> bool:
+    """M3U dosyasını sadece stream URL olarak günceller (minimal)."""
+    try:
+        content = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1280000,RESOLUTION=1280x720\n" + stream_url
+        filepath.write_text(content, encoding="utf-8")
+        return True
+    except Exception as e:
+        print(f"[HATA] {filepath.name} yazılamadı: {e}")
+        return False
+
+def process_channel(channel: Dict, index: int, total: int) -> Tuple[str, Optional[str]]:
+    """Tek bir kanalı işler, stream URL'sini alır."""
+    name = channel.get("name", f"Kanal_{index}")
+    url = channel.get("url") or channel.get("youtube_url", "")
+    
+    print(f"\n🔄 [{index}/{total}] {name}")
+    
+    if not url:
+        print(f"   ⚠️ URL yok, atlanıyor.")
+        return (name, None)
+    
+    channel_type = get_channel_type(channel)
+    
+    if channel_type == "eurostar":
+        stream_url = get_eurostar_token()
+    elif channel_type == "showturk":
+        stream_url = get_showturk_token()
+    elif channel_type == "direct":
+        stream_url = url
+    else:
+        # YouTube veya bilinmeyen
+        stream_url = get_youtube_stream_with_ytdlp(url)
+    
+    if stream_url:
+        print(f"   ✅ Stream URL alındı: {stream_url[:60]}...")
+    else:
+        print(f"   ❌ Stream URL alınamadı!")
+    
+    return (name, stream_url)
+
+def main() -> int:
+    print("=" * 70)
+    print(" YOUTUBE STREAM KURTARICI - M3U ENTEGRASYONU")
+    print(f" Başlangıç: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 70)
+    
+    # 1. Cookie'leri kontrol et
+    ensure_cookies()
+    
+    # 2. Config yükle
+    config = load_config()
+    channels = config.get("channels", [])
+    if not channels:
+        print("[HATA] config.json'da kanal bulunamadı!")
+        return 1
+    
+    print(f"\n[INFO] {len(channels)} kanal işlenecek.")
+    
+    # 3. Tüm kanalları işle
+    results = []
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {
+            executor.submit(process_channel, ch, idx, len(channels)): idx 
+            for idx, ch in enumerate(channels, 1)
+        }
+        for future in as_completed(futures):
+            results.append(future.result())
+    
+    # 4. Sonuçları işle ve M3U dosyalarını güncelle
+    success_count = 0
+    for name, stream_url in results:
+        if not stream_url:
+            continue
+        
+        # Dosya adını bul
+        filename = safe_filename(name)
+        m3u_file = PLAYLIST_DIR / f"{filename}.m3u"
+        
+        # Eğer dosya yoksa oluştur
+        if not m3u_file.exists():
+            update_m3u_direct(m3u_file, stream_url)
+            print(f"   [YENİ] {m3u_file.name} oluşturuldu.")
+        else:
+            update_m3u_file(m3u_file, stream_url)
+            print(f"   [GÜNCELLE] {m3u_file.name} güncellendi.")
+        
+        success_count += 1
+    
+    # 5. Ana playlist'i yeniden oluştur
+    print("\n[INFO] Ana playlist oluşturuluyor...")
+    generate_main_playlist()
+    
+    print(f"\n[OK] {success_count}/{len(channels)} kanal başarıyla güncellendi.")
+    print(f"[OK] İşlem tamamlandı: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    return 0
 
 def safe_filename(name: str) -> str:
     """Kanal adını güvenli dosya adına çevirir."""
     replacements = {
-        "ç": "c", "Ç": "C", "ğ": "g", "Ğ": "G",
-        "ı": "i", "İ": "I", "ö": "o", "Ö": "O",
-        "ş": "s", "Ş": "S", "ü": "u", "Ü": "U",
-        " ": "_", "'": "", '"': "", "?": "", "!": "",
-        ",": "", ".": "", ";": "", ":": "", "(": "", ")": "",
-        "[": "", "]": "", "{": "", "}": ""
+        "ç": "c", "ğ": "g", "ı": "i", "ö": "o", "ş": "s", "ü": "u",
+        "Ç": "C", "Ğ": "G", "İ": "I", "Ö": "O", "Ş": "S", "Ü": "U",
+        " ": "_", "'": "", '"': "", "?": "", "!": "", ",": "", ".": "",
+        ";": "", ":": "", "(": "", ")": "", "[": "", "]": ""
     }
     for old, new in replacements.items():
         name = name.replace(old, new)
     name = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip("_")
     return name if name else "kanal"
 
-def get_showturk_token() -> Optional[str]:
-    """Show Türk için güncel token alır."""
-    try:
-        import requests
-    except ImportError:
-        print("[HATA] requests modülü yüklü değil. 'pip install requests'")
-        return None
+def generate_main_playlist():
+    """Ana playlist'i yeniden oluşturur."""
+    output_file = PLAYLIST_DIR / "playerlist.m3u"
+    github_base = "https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist"
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml",
-    }
-    try:
-        resp = requests.get(SHOWTURK_PAGE, headers=headers, timeout=15)
-        html = resp.text
-        match = re.search(SHOWTURK_PATTERN, html)
-        if match:
-            e, st = match.groups()
-            return f"https://ciner-live.ercdn.net/showturk/playlist.m3u8?e={e}&st={st}&tv=1"
-        print("[UYARI] Show Türk token bulunamadı, eski URL kullanılacak.")
-        return None
-    except Exception as e:
-        print(f"[HATA] Show Türk token alınamadı: {e}")
-        return None
-
-def get_channel_name_from_file(filepath: Path) -> str:
-    """Dosya adından kanal adını çıkarır (uzantısız)."""
-    return filepath.stem
-
-def is_valid_m3u_file(filepath: Path) -> bool:
-    """Geçerli bir .m3u dosyası mı kontrol eder (playerlist ve playlist hariç)."""
-    if filepath.name in ["playerlist.m3u", "playlist.m3u8"]:
-        return False
-    if not filepath.suffix.lower() in [".m3u", ".m3u8"]:
-        return False
-    if filepath.stat().st_size < 10:  # Çok küçük dosyaları atla
-        return False
-    return True
-
-def read_m3u_content(filepath: Path) -> Optional[str]:
-    """M3U dosyasını okur, ilk geçerli stream URL'sini döndürür."""
-    try:
-        content = filepath.read_text(encoding="utf-8", errors="ignore")
-        lines = content.splitlines()
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                if line.startswith("http://") or line.startswith("https://"):
-                    return line
-        return None
-    except Exception as e:
-        print(f"[HATA] {filepath.name} okunamadı: {e}")
-        return None
-
-def generate_main_playlist(channel_files: List[Path], direct_streams: Dict[str, str]) -> str:
-    """
-    Ana playlist içeriğini oluşturur.
-    - channel_files: playlist klasöründeki tüm .m3u dosyaları
-    - direct_streams: doğrudan URL kullanılacak kanallar {kanal_adı: stream_url}
-    """
+    files = list(PLAYLIST_DIR.glob("*.m3u"))
+    files = [f for f in files if f.name not in ["playerlist.m3u", "playlist.m3u8"]]
+    
     lines = ["#EXTM3U"]
-    processed_names: Set[str] = set()
+    for f in sorted(files):
+        name = f.stem.replace("_", " ").strip()
+        lines.append(f"#EXTINF:0,{name}")
+        lines.append(f"{github_base}/{f.name}")
     
-    # Önce doğrudan stream kanallarını ekle
-    for name, url in direct_streams.items():
-        if url and name not in processed_names:
-            lines.append(f"#EXTINF:0,{name}")
-            lines.append(url)
-            processed_names.add(name)
-            print(f"[EKLE] {name} -> doğrudan stream")
-    
-    # Sonra tüm .m3u dosyalarını tara
-    for filepath in sorted(channel_files):
-        if not is_valid_m3u_file(filepath):
-            continue
-        
-        name = get_channel_name_from_file(filepath)
-        
-        # Zaten eklendiyse atla
-        if name in processed_names:
-            continue
-        
-        # Dosya içeriğini kontrol et
-        stream_url = read_m3u_content(filepath)
-        if not stream_url:
-            print(f"[UYARI] {filepath.name} içinde geçerli URL yok, atlanıyor.")
-            continue
-        
-        # Dosya adı ve kanal adını normalize et
-        display_name = name.replace("_", " ").strip()
-        
-        # GitHub raw URL'si oluştur
-        raw_url = f"{GITHUB_RAW_BASE}/{filepath.name}"
-        
-        lines.append(f"#EXTINF:0,{display_name}")
-        lines.append(raw_url)
-        processed_names.add(name)
-        print(f"[EKLE] {display_name} -> {filepath.name}")
-    
-    return "\n".join(lines) + "\n"
-
-def backup_existing(output_file: Path) -> bool:
-    """Mevcut playlist'i yedekler."""
-    if output_file.exists():
-        try:
-            backup_path = output_file.with_suffix(".m3u.bak")
-            backup_path.write_text(output_file.read_text(encoding="utf-8"))
-            print(f"[YEDEK] {output_file.name} -> {backup_path.name}")
-            return True
-        except Exception as e:
-            print(f"[HATA] Yedekleme başarısız: {e}")
-    return False
-
-def fix_show_turk_entry(content: str) -> str:
-    """Show_Turk entry'sini günceller (token yeniler)."""
-    token_url = get_showturk_token()
-    if not token_url:
-        return content
-    
-    lines = content.splitlines()
-    new_lines = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        new_lines.append(line)
-        # Show_Turk satırını bul
-        if "#EXTINF" in line and "Show_Turk" in line:
-            # Bir sonraki satır URL ise değiştir
-            if i + 1 < len(lines) and lines[i+1].strip().startswith("http"):
-                new_lines.append(token_url)
-                i += 1  # Eski URL'yi atla
-                print("[GÜNCELLE] Show_Turk token yenilendi.")
-        i += 1
-    
-    return "\n".join(new_lines)
-
-def fix_show_max_entry(content: str) -> str:
-    """Show_Max entry'sini düzeltir - direkt stream URL kullan."""
-    # Show_Max genelde YouTube stream'i olduğu için URL'sini bulmaya çalış
-    # Eğer playerlist'te Show_Max varsa ve .m3u dosyası mevcutsa içindeki URL'yi kullan
-    show_max_file = PLAYLIST_DIR / "Show_Max.m3u"
-    if show_max_file.exists():
-        stream_url = read_m3u_content(show_max_file)
-        if stream_url:
-            lines = content.splitlines()
-            new_lines = []
-            i = 0
-            while i < len(lines):
-                line = lines[i]
-                new_lines.append(line)
-                if "#EXTINF" in line and "Show_Max" in line:
-                    if i + 1 < len(lines) and lines[i+1].strip().startswith("http"):
-                        new_lines.append(stream_url)
-                        i += 1
-                        print("[GÜNCELLE] Show_Max URL güncellendi.")
-                i += 1
-            return "\n".join(new_lines)
-    return content
-
-def main() -> int:
-    print("=" * 70)
-    print(" M3U PLAYLIST YENİDEN OLUŞTURUCU v2.0")
-    print(f" Başlangıç: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
-    
-    # 1. Playlist klasörünü kontrol et
-    if not PLAYLIST_DIR.exists():
-        print(f"[HATA] {PLAYLIST_DIR} klasörü bulunamadı!")
-        return 1
-    
-    # 2. Tüm M3U dosyalarını tara
-    m3u_files = list(PLAYLIST_DIR.glob("*.m3u")) + list(PLAYLIST_DIR.glob("*.m3u8"))
-    m3u_files = [f for f in m3u_files if is_valid_m3u_file(f)]
-    
-    print(f"\n[INFO] {len(m3u_files)} adet M3U dosyası bulundu.")
-    for f in sorted(m3u_files):
-        print(f"   - {f.name}")
-    
-    # 3. Doğrudan stream kanallarını belirle
-    direct_streams: Dict[str, str] = {}
-    
-    # Show_Turk: token yenile
-    showturk_url = get_showturk_token()
-    if showturk_url:
-        direct_streams["Show_Turk"] = showturk_url
-    else:
-        # Yedek: Show_Turk.m3u dosyasından oku
-        showturk_file = PLAYLIST_DIR / "Show_Turk.m3u"
-        if showturk_file.exists():
-            url = read_m3u_content(showturk_file)
-            if url:
-                direct_streams["Show_Turk"] = url
-    
-    # Show_Max: .m3u dosyasından oku
-    showmax_file = PLAYLIST_DIR / "Show_Max.m3u"
-    if showmax_file.exists():
-        url = read_m3u_content(showmax_file)
-        if url:
-            direct_streams["Show_Max"] = url
-    
-    # 4. Yedek al
-    if OUTPUT_FILE.exists():
-        backup_existing(OUTPUT_FILE)
-    
-    # 5. Ana playlist'i oluştur
-    content = generate_main_playlist(m3u_files, direct_streams)
-    
-    # 6. Özel düzeltmeler
-    content = fix_show_turk_entry(content)
-    content = fix_show_max_entry(content)
-    
-    # 7. Dosyayı yaz
-    try:
-        OUTPUT_FILE.write_text(content, encoding="utf-8")
-        print(f"\n[OK] {OUTPUT_FILE} başarıyla oluşturuldu.")
-        print(f"   - Boyut: {OUTPUT_FILE.stat().st_size} bayt")
-        print(f"   - Satır sayısı: {len(content.splitlines())}")
-    except Exception as e:
-        print(f"[HATA] Dosya yazılamadı: {e}")
-        return 1
-    
-    # 8. İstatistik
-    lines = content.splitlines()
-    extinf_count = sum(1 for line in lines if line.startswith("#EXTINF"))
-    url_count = sum(1 for line in lines if line.startswith("http"))
-    
-    print(f"\n[İSTATİSTİK]")
-    print(f"   - Toplam kanal: {extinf_count}")
-    print(f"   - Geçerli URL: {url_count}")
-    print(f"   - Eksik/boş: {extinf_count - url_count}")
-    
-    # 9. Eksik kanalları kontrol et
-    all_files = set(f.stem for f in m3u_files)
-    all_files.discard("playerlist")
-    all_files.discard("playlist")
-    
-    listed_names = set()
-    for line in lines:
-        if line.startswith("#EXTINF"):
-            # #EXTINF:0,Kanal_Adı
-            match = re.search(r"#EXTINF:[^,]+,(.+?)(?:\s*$)", line)
-            if match:
-                name = match.group(1).strip().replace(" ", "_")
-                listed_names.add(name)
-    
-    missing = all_files - listed_names
-    if missing:
-        print(f"\n[UYARI] Aşağıdaki kanallar listede yok:")
-        for name in sorted(missing):
-            print(f"   - {name}")
-    
-    print(f"\n[OK] İşlem tamamlandı: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    return 0
+    output_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Aynısını playlist.m3u8 olarak da kaydet
+    (PLAYLIST_DIR / "playlist.m3u8").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"[OK] {output_file.name} oluşturuldu, {len(files)} kanal.")
 
 if __name__ == "__main__":
     sys.exit(main())
