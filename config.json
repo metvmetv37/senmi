@@ -2,7 +2,7 @@
   "quality": "best[height<=1080][fps<=50]/best",
   "output_folder": "playlist",
   "output_playlist": "playlist.m3u8",
-  "github_raw_base": "https://raw.githubusercontent.com/metvmetv37/senmi/main",
+  "github_raw_base": "https://raw.githubusercontent.com/Tahir2020/TR_Avrupa/main",
   "channels": [
     {
       "name": "Euro_Star_TV",
