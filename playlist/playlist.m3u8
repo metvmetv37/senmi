@@ -2,7 +2,7 @@
 #EXTINF:0,Euro_Star_TV
 https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/Euro_Star_TV.m3u
 #EXTINF:0,Show_Turk
-https://ciner-live.ercdn.net/showturk/playlist.m3u8?e=1788370332&st=Xx0c92bgwmyogjc8fa1L1A&tv=1
+https://ciner-live.ercdn.net/showturk/playlist.m3u8?e=1788382995&st=2YExr8qyP6m20Q0iST_bAA&tv=1
 #EXTINF:0,Kanal_Euro_D
 https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/Kanal_Euro_D.m3u
 #EXTINF:0,Show_Max
@@ -15,3 +15,7 @@ https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/NOW.
 https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/Kanal_7_Avrupa.m3u
 #EXTINF:0,Teve2
 https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/Teve2.m3u
+#EXTINF:0,Halk_TV
+https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/Halk_TV.m3u
+#EXTINF:0,Sozcu_TV
+https://raw.githubusercontent.com/metvmetv37/senmi/refs/heads/main/playlist/Sozcu_TV.m3u
